@@ -1,10 +1,10 @@
-const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();const initData=tg?.initData||'',headers={'X-Telegram-Init-Data':initData};let timer, statusTimer, licenseActive=false, currentTaskId=null;
-const saved=JSON.parse(localStorage.getItem('licensia-theme')||'{}');function setTheme(t,a){document.documentElement.dataset.theme=t;document.documentElement.style.setProperty('--accent',a);localStorage.setItem('licensia-theme',JSON.stringify({t,a}))}setTheme(saved.t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'),saved.a||'#7c5cff');
+const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();const initData=tg?.initData||'',headers={'X-Telegram-Init-Data':initData};let timer,statusTimer,supportTimer,licenseActive=false,currentTaskId=null;
+const saved=JSON.parse(localStorage.getItem('neverk-theme')||'{}');function setTheme(t,a){document.documentElement.dataset.theme=t;document.documentElement.style.setProperty('--accent',a);localStorage.setItem('neverk-theme',JSON.stringify({t,a}))}setTheme(saved.t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'),saved.a||'#7c5cff');
 const q=s=>document.querySelector(s);
 const request=async(url,o={})=>{const r=await fetch(url,{...o,headers:{...headers,...o.headers}}),d=await r.json();if(!r.ok)throw Error(d.detail||'Ошибка');return d};
 document.querySelectorAll('dialog .modal-title button').forEach(button=>button.addEventListener('click',event=>{event.preventDefault();const dialog=button.closest('dialog');if(dialog.id==='payment')clearInterval(timer);dialog.close()}));
 document.querySelector('#theme form').addEventListener('submit',event=>{event.preventDefault();document.querySelector('#theme').close()});document.querySelector('#saveTheme').addEventListener('click',()=>document.querySelector('#theme').close());function show(id){document.querySelectorAll('.screen').forEach(x=>x.classList.remove('active'));document.querySelector('#'+id).classList.add('active');document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.screen===id));scrollTo(0,0)}document.querySelectorAll('.nav').forEach(x=>x.onclick=()=>show(x.dataset.screen));
-document.querySelector('#settings').onclick=()=>document.querySelector('#theme').showModal();document.querySelector('#support').onclick=()=>document.querySelector('#supportDialog').showModal();document.querySelectorAll('[data-theme]').forEach(x=>x.onclick=e=>{e.preventDefault();setTheme(x.dataset.theme,getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())});document.querySelector('#accent').oninput=e=>setTheme(document.documentElement.dataset.theme,e.target.value);
+document.querySelector('#settings').onclick=()=>document.querySelector('#theme').showModal();document.querySelectorAll('[data-theme]').forEach(x=>x.onclick=e=>{e.preventDefault();setTheme(x.dataset.theme,getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())});document.querySelector('#accent').oninput=e=>setTheme(document.documentElement.dataset.theme,e.target.value);
 
 async function plans(){const p=await request('/api/plans');document.querySelector('#plans').innerHTML=p.map((x,i)=>`<article class="plan ${i===1?'chosen':''}">${i===1?'<b class="tag">ВЫГОДНО</b>':''}<h2>${x.days===null?'Навсегда':x.days+' дней'}</h2><p>${x.days===null?'Единоразовая покупка':'Полный доступ на период'}</p><div class="price">${x.price}<small> USDT</small></div><button class="buy" data-plan="${x.id}">Купить</button></article>`).join('');document.querySelectorAll('[data-plan]').forEach(x=>x.onclick=()=>buy(x.dataset.plan))}
 let currentPayUrl='';const payButton=document.querySelector('#payLink');
@@ -12,11 +12,10 @@ payButton.addEventListener('click',event=>{event.preventDefault();if(!currentPay
 async function buy(plan){try{const d=await request('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan})});currentPayUrl=d.pay_url;payButton.href=d.pay_url;document.querySelector('#payment').showModal();clearInterval(timer);timer=setInterval(()=>check(d.invoice_id),5000)}catch(e){alert(e.message)}}async function check(id){try{const d=await request('/api/orders/'+id);if(d.status==='paid'){clearInterval(timer);document.querySelector('#paymentStatus').textContent='Готово! Ваш ключ: '+d.key;tg?.HapticFeedback?.notificationOccurred('success');me()}}catch{}}
 
 function date(x){return x?new Date(x).toLocaleDateString('ru-RU'):'Бессрочно'}
-const profileCard=q('#profileCard'), termsDialog=q('#terms'), agreeButton=q('#agree'), activationStatus=q('#activationStatus'), licenseKey=q('#licenseKey');
+function timeAgo(x){if(!x)return'';const d=new Date(x),n=new Date(),s=Math.floor((n-d)/1000);if(s<60)return'только что';if(s<3600)return Math.floor(s/60)+' мин назад';if(s<86400)return Math.floor(s/3600)+' ч назад';return d.toLocaleDateString('ru-RU')}
+const profileCard=q('#profileCard'),termsDialog=q('#terms'),agreeButton=q('#agree'),activationStatus=q('#activationStatus'),licenseKey=q('#licenseKey');
 
 // ============= РАССЫЛКА =============
-let broadcastState={step:'home', accounts:[], selectedAccountIds:[], mode:'normal'};
-
 async function loadAccounts(){try{return await request('/api/accounts')}catch{return[]}}
 
 async function renderBroadcast(step='home',state={}){
@@ -59,13 +58,16 @@ async function renderBroadcast(step='home',state={}){
    };
    return;
  }
- if(step==='running'){
-   root.innerHTML='<div class="card status-card"><p class="eyebrow">РАССЫЛКА АКТИВНА</p><h2>Цикл <b id="cycle">0</b></h2><p class="muted" id="taskMeta">Загрузка…</p><div class="status-number"><b id="sentCount">0</b><span>отправлено в чаты</span></div><button id="stopDemo" class="danger">Завершить рассылку</button></div>';
-   q('#stopDemo').onclick=async()=>{if(currentTaskId){try{await request('/api/broadcast/stop/'+currentTaskId,{method:'POST'})}catch{}}clearInterval(statusTimer);renderBroadcast('home')};
-   clearInterval(statusTimer);
-   const refresh=async()=>{if(!currentTaskId)return;try{const d=await request('/api/broadcast/status/'+currentTaskId);q('#cycle').textContent=d.current_cycle;q('#sentCount').textContent=d.sent_count;q('#taskMeta').textContent=(d.safe_mode?'Безопасный':'Обычный')+' · Групп: '+d.groups_count;if(d.status!=='active'){clearInterval(statusTimer)}}catch{}};
-   refresh();statusTimer=setInterval(refresh,5000);
- }
+}
+
+async function renderRunning(taskId){
+  const root=q('#broadcastApp');if(!root)return;
+  currentTaskId=taskId;
+  root.innerHTML='<div class="card status-card"><p class="eyebrow">РАССЫЛКА АКТИВНА</p><h2>Цикл <b id="cycle">—</b></h2><p class="muted" id="taskMeta">Загрузка…</p><div class="status-number"><b id="sentCount">0</b><span>отправлено в чаты</span></div><button id="stopDemo" class="danger">Завершить рассылку</button></div>';
+  q('#stopDemo').onclick=async()=>{if(currentTaskId){try{await request('/api/broadcast/stop/'+currentTaskId,{method:'POST'})}catch{}}clearInterval(statusTimer);currentTaskId=null;renderBroadcast('home')};
+  clearInterval(statusTimer);
+  const refresh=async()=>{if(!currentTaskId)return;try{const d=await request('/api/broadcast/status/'+currentTaskId);const c=q('#cycle');if(c)c.textContent=d.current_cycle;const s=q('#sentCount');if(s)s.textContent=d.sent_count;const m=q('#taskMeta');if(m)m.textContent=(d.safe_mode?'Безопасный':'Обычный')+' · Групп: '+d.groups_count+' · Интервал: '+d.interval_minutes+' мин';if(d.status!=='active'){clearInterval(statusTimer);currentTaskId=null;renderBroadcast('home')}}catch{}};
+  refresh();statusTimer=setInterval(refresh,5000);
 }
 
 // ============= ПОДКЛЮЧЕНИЕ АККАУНТА =============
@@ -96,14 +98,33 @@ q('#verifyPasswordBtn')?.addEventListener('click',async()=>{
   catch(e){q('#connectStatus').textContent=e.message}
 });
 
+// ============= ПОДДЕРЖКА (ЧАТ) =============
+function renderSupportMessages(messages){
+  const box=q('#supportChat');if(!box)return;
+  if(!messages.length){box.innerHTML='<p class="muted" style="text-align:center;padding:20px">Напишите первое сообщение — администратор ответит.</p>';return}
+  box.innerHTML=messages.map(m=>`<div class="support-msg ${m.sender==='admin'?'admin':'user'}"><div class="support-bubble">${escapeHtml(m.message)}</div><div class="support-time">${m.sender==='admin'?'Поддержка':'Вы'} · ${timeAgo(m.created_at)}</div></div>`).join('');
+  box.scrollTop=box.scrollHeight;
+}
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function loadSupport(){try{const d=await request('/api/support/ticket');renderSupportMessages(d.messages);return d.ticket_id}catch{return null}}
+q('#support').onclick=async()=>{q('#supportDialog').showModal();q('#supportStatus').textContent='';await loadSupport();clearInterval(supportTimer);supportTimer=setInterval(loadSupport,7000)};
+q('#supportForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const text=q('#supportText').value.trim();if(!text)return;
+  q('#sendSupport').disabled=true;
+  try{await request('/api/support/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});q('#supportText').value='';await loadSupport()}
+  catch(err){q('#supportStatus').textContent=err.message}
+  finally{q('#sendSupport').disabled=false}
+});
+document.querySelector('#supportDialog .modal-title button').addEventListener('click',()=>clearInterval(supportTimer));
+
 // ============= АДМИН =============
 async function loadAdmin(){try{const d=await request('/api/admin/summary');q('#adminPaid').textContent=d.paid_total;q('#adminOrders').textContent=d.orders_total;q('#adminUsers').textContent=d.users_total;q('#adminRevenue').textContent=d.revenue_usdt+' USDT'}catch(e){alert(e.message)}}
 q('#refreshAdmin').onclick=loadAdmin;
 q('#createManualKey').onclick=async()=>{try{const d=await request('/api/admin/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration_days:Number(q('#manualDays').value)})});q('#manualKeyResult').textContent='Ключ: '+d.key+' · '+(d.duration_days===-1?'бессрочно':d.duration_days+' дней')}catch(e){q('#manualKeyResult').textContent=e.message}};
 async function loadUsers(){try{const users=await request('/api/admin/users');q('#usersList').innerHTML=users.length?users.map(x=>'<p><b>'+x.telegram_id+'</b><br><small>'+(x.license_key||'Нет активного ключа')+'</small></p>').join(''):'<p class="muted">Пользователей пока нет.</p>'}catch(e){alert(e.message)}}q('#loadUsers').onclick=loadUsers;
-async function loadTickets(){try{const tickets=await request('/api/admin/tickets');q('#ticketsList').innerHTML=tickets.length?tickets.map(x=>'<article><b>#'+x.id+' · '+x.telegram_id+'</b><p>'+x.message+'</p><textarea data-reply="'+x.id+'" placeholder="Ответ пользователю"></textarea><button class="replyTicket buy" data-ticket="'+x.id+'">Ответить</button></article>').join(''):'<p class="muted">Обращений пока нет.</p>';document.querySelectorAll('.replyTicket').forEach(button=>button.onclick=async()=>{const id=button.dataset.ticket,box=q('[data-reply="'+id+'"]');try{await request('/api/admin/tickets/'+id+'/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:box.value})});box.value='';button.textContent='Отправлено';loadTickets()}catch(e){alert(e.message)}})}catch(e){alert(e.message)}}q('#loadTickets').onclick=loadTickets;
-q('#sendSupport').onclick=async()=>{const status=q('#supportStatus');try{const d=await request('/api/support',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q('#supportText').value})});q('#supportText').value='';status.textContent='Отправлено, номер обращения: #'+d.ticket_id}catch(e){status.textContent=e.message}};
+async function loadTickets(){try{const tickets=await request('/api/admin/support/tickets');q('#ticketsList').innerHTML=tickets.length?tickets.map(x=>'<article><b>#'+x.id+' · '+x.telegram_id+'</b><p>'+escapeHtml(x.last_message)+'</p><textarea data-reply="'+x.id+'" placeholder="Ответ пользователю"></textarea><button class="replyTicket buy" data-ticket="'+x.id+'">Ответить</button></article>').join(''):'<p class="muted">Обращений пока нет.</p>';document.querySelectorAll('.replyTicket').forEach(button=>button.onclick=async()=>{const id=button.dataset.ticket,box=q('[data-reply="'+id+'"]');if(!box.value.trim())return;try{await request('/api/admin/support/tickets/'+id+'/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:box.value})});box.value='';button.textContent='Отправлено';setTimeout(loadTickets,800)}catch(e){alert(e.message)}})}catch(e){alert(e.message)}}q('#loadTickets').onclick=loadTickets;
 
-async function me(){try{const d=await request('/api/me');q('#adminNav').hidden=!d.is_admin;if(d.is_admin)loadAdmin();licenseActive=Boolean(d.license_key);renderBroadcast();profileCard.innerHTML=`<div class="avatar">◉</div><div><b>Пользователь Telegram</b><p class="muted">ID: ${d.telegram_id}</p></div><div class="license"><small>${d.license_key?'ДОСТУП АКТИВЕН':'НЕТ ДОСТУПА'}</small><b>${d.license_key?'до '+date(d.expires_at):'—'}</b></div>`;if(!d.terms_accepted)termsDialog.showModal()}catch{profileCard.innerHTML='<b>Откройте приложение через Telegram</b>'}}
+async function me(){try{const d=await request('/api/me');q('#adminNav').hidden=!d.is_admin;if(d.is_admin)loadAdmin();licenseActive=Boolean(d.license_key);profileCard.innerHTML=`<div class="avatar">◉</div><div><b>Пользователь Telegram</b><p class="muted">ID: ${d.telegram_id}</p></div><div class="license"><small>${d.license_key?'ДОСТУП АКТИВЕН':'НЕТ ДОСТУПА'}</small><b>${d.license_key?'до '+date(d.expires_at):'—'}</b></div>`;if(!d.terms_accepted)termsDialog.showModal();if(d.active_task_id){await renderRunning(d.active_task_id)}else{await renderBroadcast()}}catch{profileCard.innerHTML='<b>Откройте приложение через Telegram</b>'}}
 agreeButton.addEventListener('click',async()=>{try{await request('/api/terms/accept',{method:'POST'});termsDialog.close();me()}catch(e){alert(e.message)}});q('#activateKey').addEventListener('click',async()=>{try{const d=await request('/api/keys/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:licenseKey.value})});activationStatus.textContent='Ключ активирован. Доступ: '+date(d.expires_at);me()}catch(e){activationStatus.textContent=e.message}});
 plans();me();
