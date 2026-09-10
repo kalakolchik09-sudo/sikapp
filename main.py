@@ -7,9 +7,11 @@ import os
 import random
 import secrets
 import asyncio
+import gc
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
@@ -17,12 +19,14 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Integer, BigInteger, String, Boolean, Text, create_engine, select, text
+from sqlalchemy import DateTime, Integer, BigInteger, String, Boolean, Text, create_engine, select, text, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait, SessionPasswordNeeded, PasswordHashInvalid, PhoneCodeInvalid, PhoneCodeExpired
 from pyrogram.enums import ChatType
+
+from cleanup import client_manager, periodic_db_cleanup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,6 +56,10 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
     pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_recycle=1800,
+    pool_timeout=30,
 )
 
 
@@ -92,7 +100,7 @@ class SupportMessage(Base):
     __tablename__ = "support_messages"
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int] = mapped_column(index=True)
-    sender: Mapped[str] = mapped_column(String(20))  # "user" или "admin"
+    sender: Mapped[str] = mapped_column(String(20))
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -131,12 +139,33 @@ class BroadcastTask(Base):
 
 
 Base.metadata.create_all(engine)
-app = FastAPI(title="neverkBOT")
-app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
-pending_clients: dict[int, Client] = {}
-pending_phone: dict[int, str] = {}
-pending_hash: dict[int, str] = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Запускает фоновые задачи очистки при старте приложения."""
+    task1 = asyncio.create_task(client_manager.cleanup_loop(interval_seconds=120))
+    task2 = asyncio.create_task(periodic_db_cleanup(engine, Session))
+    logger.info("[LIFESPAN] Фоновые задачи очистки запущены")
+    try:
+        yield
+    finally:
+        task1.cancel()
+        task2.cancel()
+        for t in (task1, task2):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        # Закрываем все pending-клиенты
+        for telegram_id in list(client_manager.clients.keys()):
+            await client_manager.remove(telegram_id)
+        gc.collect()
+        logger.info("[LIFESPAN] Очистка завершена")
+
+
+app = FastAPI(title="neverkBOT", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
 class Checkout(BaseModel):
@@ -317,6 +346,22 @@ def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/health")
+def health():
+    """Health-check для Railway."""
+    import psutil
+    try:
+        mem = psutil.virtual_memory()
+        return {
+            "status": "ok",
+            "memory_percent": mem.percent,
+            "pending_clients": len(client_manager.clients),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except ImportError:
+        return {"status": "ok", "pending_clients": len(client_manager.clients)}
+
+
 @app.get("/api/plans")
 def plans():
     return [{"id": ident, **plan, "currency": "USDT"} for ident, plan in PLANS.items()]
@@ -395,7 +440,7 @@ def admin_users(x_telegram_init_data: str | None = Header(default=None)):
 
 
 # ============================================================
-# ПОДДЕРЖКА — ПОЛНОЦЕННЫЙ ЧАТ
+# ПОДДЕРЖКА
 # ============================================================
 
 @app.get("/api/support/ticket")
@@ -587,9 +632,7 @@ async def send_code(body: PhoneRequest, x_telegram_init_data: str | None = Heade
         except Exception:
             pass
         raise HTTPException(400, f"Ошибка отправки кода: {e}")
-    pending_clients[telegram_id] = client
-    pending_phone[telegram_id] = phone
-    pending_hash[telegram_id] = sent.phone_code_hash
+    await client_manager.add(telegram_id, client, phone, sent.phone_code_hash)
     return {"ok": True}
 
 
@@ -597,11 +640,12 @@ async def send_code(body: PhoneRequest, x_telegram_init_data: str | None = Heade
 async def verify_code(body: CodeRequest, x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
     require_license(telegram_id)
-    client = pending_clients.get(telegram_id)
-    phone = pending_phone.get(telegram_id)
-    phash = pending_hash.get(telegram_id)
-    if not client or not phone or not phash:
+    data = await client_manager.get(telegram_id)
+    if not data:
         raise HTTPException(400, "Сессия истекла. Начните заново.")
+    client = data["client"]
+    phone = data["phone"]
+    phash = data["phone_hash"]
     try:
         await client.sign_in(phone, phash, body.code.strip())
     except SessionPasswordNeeded:
@@ -611,16 +655,10 @@ async def verify_code(body: CodeRequest, x_telegram_init_data: str | None = Head
     except Exception as e:
         raise HTTPException(400, f"Ошибка: {e}")
     session_string = await client.export_session_string()
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
     with Session(engine) as db:
         db.add(Account(telegram_id=telegram_id, phone_number=phone, session_string=session_string))
         db.commit()
-    pending_clients.pop(telegram_id, None)
-    pending_phone.pop(telegram_id, None)
-    pending_hash.pop(telegram_id, None)
+    await client_manager.remove(telegram_id)
     return {"ok": True}
 
 
@@ -628,10 +666,11 @@ async def verify_code(body: CodeRequest, x_telegram_init_data: str | None = Head
 async def verify_password(body: PasswordRequest, x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
     require_license(telegram_id)
-    client = pending_clients.get(telegram_id)
-    phone = pending_phone.get(telegram_id)
-    if not client or not phone:
+    data = await client_manager.get(telegram_id)
+    if not data:
         raise HTTPException(400, "Сессия истекла. Начните заново.")
+    client = data["client"]
+    phone = data["phone"]
     try:
         await client.check_password(body.password)
     except PasswordHashInvalid:
@@ -639,16 +678,10 @@ async def verify_password(body: PasswordRequest, x_telegram_init_data: str | Non
     except Exception as e:
         raise HTTPException(400, f"Ошибка: {e}")
     session_string = await client.export_session_string()
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
     with Session(engine) as db:
         db.add(Account(telegram_id=telegram_id, phone_number=phone, session_string=session_string))
         db.commit()
-    pending_clients.pop(telegram_id, None)
-    pending_phone.pop(telegram_id, None)
-    pending_hash.pop(telegram_id, None)
+    await client_manager.remove(telegram_id)
     return {"ok": True}
 
 
@@ -842,6 +875,9 @@ async def broadcast_worker(task_id: int):
                 await client.stop()
             except Exception:
                 pass
+        # Освобождаем ссылки на клиентов для GC
+        clients.clear()
+        gc.collect()
         with Session(engine) as db:
             t = db.get(BroadcastTask, task_id)
             if t:
@@ -973,7 +1009,6 @@ async def telegram_webhook(secret: str, request: Request):
         raise HTTPException(404, "Не найдено")
     update = await request.json()
 
-    # callback от кнопки «Завершить рассылку»
     callback = update.get("callback_query")
     if callback:
         data = callback.get("data", "")
@@ -991,12 +1026,13 @@ async def telegram_webhook(secret: str, request: Request):
                     db.commit()
                     status_message_id = task.status_message_id
                     text = build_status_text(task)
+                    telegram_id = task.telegram_id
                 else:
-                    task = None
+                    telegram_id = None
                     text = ""
                     status_message_id = None
-            if status_message_id:
-                await tg_edit(task.telegram_id, status_message_id, text)
+            if status_message_id and telegram_id:
+                await tg_edit(telegram_id, status_message_id, text)
             await tg_answer_callback(callback_id, "Рассылка остановлена")
             return {"ok": True}
         if data.startswith("sup_reply_"):
@@ -1005,14 +1041,10 @@ async def telegram_webhook(secret: str, request: Request):
             except ValueError:
                 await tg_answer_callback(callback_id, "Ошибка")
                 return {"ok": True}
-            with Session(engine) as db:
-                ticket = db.get(SupportTicket, ticket_id)
-                recipient = ticket.telegram_id if ticket else None
-            if recipient:
-                await tg_send(
-                    ADMIN_TELEGRAM_ID,
-                    f"✍️ <b>Ответ на тикет #{ticket_id}</b>\n\nНапишите ваш ответ одним сообщением:",
-                )
+            await tg_send(
+                ADMIN_TELEGRAM_ID,
+                f"✍️ <b>Ответ на тикет #{ticket_id}</b>\n\nНапишите ваш ответ одним сообщением в этот чат.",
+            )
             await tg_answer_callback(callback_id, "Напишите ответ в чат")
             return {"ok": True}
         await tg_answer_callback(callback_id)
@@ -1024,7 +1056,6 @@ async def telegram_webhook(secret: str, request: Request):
     if not chat_id:
         return {"ok": True}
 
-    # Ответ админа на тикет (если это reply на сообщение поддержки — обрабатываем ниже)
     if text.startswith("/start"):
         if not BOT_TOKEN:
             return {"ok": True}
@@ -1042,7 +1073,6 @@ async def telegram_webhook(secret: str, request: Request):
         await tg_send(chat_id, welcome, keyboard)
         return {"ok": True}
 
-    # Ответ админа через reply на уведомление поддержки
     reply_to = message.get("reply_to_message", {})
     if chat_id == ADMIN_TELEGRAM_ID and reply_to:
         reply_text = reply_to.get("text", "")
