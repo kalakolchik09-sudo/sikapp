@@ -1,0 +1,109 @@
+const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();const initData=tg?.initData||'',headers={'X-Telegram-Init-Data':initData};let timer, statusTimer, licenseActive=false, currentTaskId=null;
+const saved=JSON.parse(localStorage.getItem('licensia-theme')||'{}');function setTheme(t,a){document.documentElement.dataset.theme=t;document.documentElement.style.setProperty('--accent',a);localStorage.setItem('licensia-theme',JSON.stringify({t,a}))}setTheme(saved.t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'),saved.a||'#7c5cff');
+const q=s=>document.querySelector(s);
+const request=async(url,o={})=>{const r=await fetch(url,{...o,headers:{...headers,...o.headers}}),d=await r.json();if(!r.ok)throw Error(d.detail||'Ошибка');return d};
+document.querySelectorAll('dialog .modal-title button').forEach(button=>button.addEventListener('click',event=>{event.preventDefault();const dialog=button.closest('dialog');if(dialog.id==='payment')clearInterval(timer);dialog.close()}));
+document.querySelector('#theme form').addEventListener('submit',event=>{event.preventDefault();document.querySelector('#theme').close()});document.querySelector('#saveTheme').addEventListener('click',()=>document.querySelector('#theme').close());function show(id){document.querySelectorAll('.screen').forEach(x=>x.classList.remove('active'));document.querySelector('#'+id).classList.add('active');document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.screen===id));scrollTo(0,0)}document.querySelectorAll('.nav').forEach(x=>x.onclick=()=>show(x.dataset.screen));
+document.querySelector('#settings').onclick=()=>document.querySelector('#theme').showModal();document.querySelector('#support').onclick=()=>document.querySelector('#supportDialog').showModal();document.querySelectorAll('[data-theme]').forEach(x=>x.onclick=e=>{e.preventDefault();setTheme(x.dataset.theme,getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())});document.querySelector('#accent').oninput=e=>setTheme(document.documentElement.dataset.theme,e.target.value);
+
+async function plans(){const p=await request('/api/plans');document.querySelector('#plans').innerHTML=p.map((x,i)=>`<article class="plan ${i===1?'chosen':''}">${i===1?'<b class="tag">ВЫГОДНО</b>':''}<h2>${x.days===null?'Навсегда':x.days+' дней'}</h2><p>${x.days===null?'Единоразовая покупка':'Полный доступ на период'}</p><div class="price">${x.price}<small> USDT</small></div><button class="buy" data-plan="${x.id}">Купить</button></article>`).join('');document.querySelectorAll('[data-plan]').forEach(x=>x.onclick=()=>buy(x.dataset.plan))}
+let currentPayUrl='';const payButton=document.querySelector('#payLink');
+payButton.addEventListener('click',event=>{event.preventDefault();if(!currentPayUrl)return;if(tg?.openLink)tg.openLink(currentPayUrl);else window.location.assign(currentPayUrl)});
+async function buy(plan){try{const d=await request('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan})});currentPayUrl=d.pay_url;payButton.href=d.pay_url;document.querySelector('#payment').showModal();clearInterval(timer);timer=setInterval(()=>check(d.invoice_id),5000)}catch(e){alert(e.message)}}async function check(id){try{const d=await request('/api/orders/'+id);if(d.status==='paid'){clearInterval(timer);document.querySelector('#paymentStatus').textContent='Готово! Ваш ключ: '+d.key;tg?.HapticFeedback?.notificationOccurred('success');me()}}catch{}}
+
+function date(x){return x?new Date(x).toLocaleDateString('ru-RU'):'Бессрочно'}
+const profileCard=q('#profileCard'), termsDialog=q('#terms'), agreeButton=q('#agree'), activationStatus=q('#activationStatus'), licenseKey=q('#licenseKey');
+
+// ============= РАССЫЛКА =============
+let broadcastState={step:'home', accounts:[], selectedAccountIds:[], mode:'normal'};
+
+async function loadAccounts(){try{return await request('/api/accounts')}catch{return[]}}
+
+async function renderBroadcast(step='home',state={}){
+ const root=q('#broadcastApp');if(!root)return;
+ if(!licenseActive){root.innerHTML='<div class="card locked"><h2>Нужен активный ключ</h2><p class="muted">Активируйте ключ в профиле, чтобы открыть панель рассылки.</p><button class="buy" id="goProfile">Открыть профиль</button></div>';q('#goProfile').onclick=()=>show('profile');return}
+ const accounts=await loadAccounts();
+ if(!accounts.length){root.innerHTML='<div class="card locked"><h2>Нет аккаунтов</h2><p class="muted">Подключите Telegram-аккаунт в профиле, чтобы начать рассылку.</p><button class="buy" id="goProfile2">Открыть профиль</button></div>';q('#goProfile2').onclick=()=>show('profile');return}
+
+ if(step==='home'){
+   root.innerHTML='<div class="card"><h2>Ваши аккаунты <small>'+accounts.length+'</small></h2><div class="account-list">'+accounts.map((a,i)=>'<div>◉ '+(a.phone||('Аккаунт '+(i+1)))+'</div>').join('')+'</div></div><button class="buy" id="beginBroadcast">Создать рассылку</button>';
+   q('#beginBroadcast').onclick=()=>renderBroadcast('accounts');
+   return;
+ }
+ if(step==='accounts'){
+   root.innerHTML='<div class="card"><h2>1. Выберите аккаунты</h2><button class="accountChoice" id="allAccounts">Все аккаунты <i>○</i></button>'+accounts.map(a=>'<button class="accountChoice" data-id="'+a.id+'">'+(a.phone||('ID '+a.id))+' <i>○</i></button>').join('')+'<button class="buy" id="confirmAccounts">Подтвердить</button></div>';
+   const mark=(button,on)=>{button.classList.toggle('selected',on);button.querySelector('i').textContent=on?'✓':'○'};
+   q('#allAccounts').onclick=()=>{const on=!q('#allAccounts').classList.contains('selected');mark(q('#allAccounts'),on);document.querySelectorAll('[data-id]').forEach(x=>mark(x,on))};
+   document.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>{mark(x,!x.classList.contains('selected'));mark(q('#allAccounts'),[...document.querySelectorAll('[data-id]')].every(y=>y.classList.contains('selected')))});
+   q('#confirmAccounts').onclick=()=>{const ids=[...document.querySelectorAll('[data-id].selected')].map(x=>Number(x.dataset.id));if(!ids.length)return alert('Выберите хотя бы один аккаунт.');renderBroadcast('mode',{ids})};
+   return;
+ }
+ if(step==='mode'){
+   root.innerHTML='<div class="card"><h2>2. Выберите режим</h2><button class="mode selected" id="normalMode"><b>⚡ Обычный</b><small>Один текст для каждого цикла</small></button><button class="mode" id="safeMode"><b>🛡 Безопасный</b><small>Три текста, ротация, ±20% интервал</small></button></div>';
+   q('#normalMode').onclick=()=>renderBroadcast('compose',{...state,mode:'normal'});
+   q('#safeMode').onclick=()=>renderBroadcast('compose',{...state,mode:'safe'});
+   return;
+ }
+ const count=state.mode==='safe'?3:1;
+ if(step==='compose'){
+   root.innerHTML='<div class="card"><h2>3. Настройка</h2><p class="muted">'+(state.mode==='safe'?'Безопасный режим: три варианта текста.':'Обычный режим: один текст.')+'</p>'+Array.from({length:count},(_,i)=>'<label>Текст '+(i+1)+'<textarea class="demoText" placeholder="Текст сообщения '+(i+1)+'"></textarea></label>').join('')+'<label>Интервал <select id="demoInterval"><option value="30">30 минут</option><option value="60" selected>60 минут</option><option value="120">120 минут</option></select></label><button class="buy" id="startDemo">Запустить рассылку</button></div>';
+   q('#startDemo').onclick=async()=>{
+     const texts=[...document.querySelectorAll('.demoText')].map(x=>x.value.trim()).filter(Boolean);
+     if(state.mode==='safe'&&texts.length<3)return alert('Заполните все три текста.');
+     if(state.mode==='normal'&&texts.length<1)return alert('Введите текст.');
+     try{
+       const d=await request('/api/broadcast/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:state.ids,messages:texts,interval_minutes:Number(q('#demoInterval').value),safe_mode:state.mode==='safe'})});
+       currentTaskId=d.task_id;
+       renderBroadcast('running',{taskId:d.task_id});
+     }catch(e){alert(e.message)}
+   };
+   return;
+ }
+ if(step==='running'){
+   root.innerHTML='<div class="card status-card"><p class="eyebrow">РАССЫЛКА АКТИВНА</p><h2>Цикл <b id="cycle">0</b></h2><p class="muted" id="taskMeta">Загрузка…</p><div class="status-number"><b id="sentCount">0</b><span>отправлено в чаты</span></div><button id="stopDemo" class="danger">Завершить рассылку</button></div>';
+   q('#stopDemo').onclick=async()=>{if(currentTaskId){try{await request('/api/broadcast/stop/'+currentTaskId,{method:'POST'})}catch{}}clearInterval(statusTimer);renderBroadcast('home')};
+   clearInterval(statusTimer);
+   const refresh=async()=>{if(!currentTaskId)return;try{const d=await request('/api/broadcast/status/'+currentTaskId);q('#cycle').textContent=d.current_cycle;q('#sentCount').textContent=d.sent_count;q('#taskMeta').textContent=(d.safe_mode?'Безопасный':'Обычный')+' · Групп: '+d.groups_count;if(d.status!=='active'){clearInterval(statusTimer)}}catch{}};
+   refresh();statusTimer=setInterval(refresh,5000);
+ }
+}
+
+// ============= ПОДКЛЮЧЕНИЕ АККАУНТА =============
+const connectDialog=q('#connectDialog');
+q('#connectAccount')?.addEventListener('click',()=>{if(!licenseActive){alert('Сначала активируйте лицензию.');return}resetConnectDialog();connectDialog.showModal()});
+function resetConnectDialog(){
+  q('#connectStep1').hidden=false;q('#connectStep2').hidden=true;q('#connectStep3').hidden=true;
+  q('#connectPhone').value='';q('#connectCode').value='';q('#connectPassword').value='';q('#connectStatus').textContent='';
+}
+q('#sendCodeBtn')?.addEventListener('click',async()=>{
+  const phone=q('#connectPhone').value.trim();if(!phone.startsWith('+'))return q('#connectStatus').textContent='Номер должен начинаться с +.';
+  q('#connectStatus').textContent='Отправка…';
+  try{await request('/api/accounts/send-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});q('#connectStep1').hidden=true;q('#connectStep2').hidden=false;q('#connectStatus').textContent='Код отправлен.'}
+  catch(e){q('#connectStatus').textContent=e.message}
+});
+q('#verifyCodeBtn')?.addEventListener('click',async()=>{
+  const code=q('#connectCode').value.trim();if(!code)return;
+  q('#connectStatus').textContent='Проверка…';
+  try{const d=await request('/api/accounts/verify-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+    if(d.need_password){q('#connectStep2').hidden=true;q('#connectStep3').hidden=false;q('#connectStatus').textContent='Введите пароль 2FA.';return}
+    connectDialog.close();me();
+  }catch(e){q('#connectStatus').textContent=e.message}
+});
+q('#verifyPasswordBtn')?.addEventListener('click',async()=>{
+  const password=q('#connectPassword').value;if(!password)return;
+  q('#connectStatus').textContent='Проверка…';
+  try{await request('/api/accounts/verify-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});connectDialog.close();me()}
+  catch(e){q('#connectStatus').textContent=e.message}
+});
+
+// ============= АДМИН =============
+async function loadAdmin(){try{const d=await request('/api/admin/summary');q('#adminPaid').textContent=d.paid_total;q('#adminOrders').textContent=d.orders_total;q('#adminUsers').textContent=d.users_total;q('#adminRevenue').textContent=d.revenue_usdt+' USDT'}catch(e){alert(e.message)}}
+q('#refreshAdmin').onclick=loadAdmin;
+q('#createManualKey').onclick=async()=>{try{const d=await request('/api/admin/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration_days:Number(q('#manualDays').value)})});q('#manualKeyResult').textContent='Ключ: '+d.key+' · '+(d.duration_days===-1?'бессрочно':d.duration_days+' дней')}catch(e){q('#manualKeyResult').textContent=e.message}};
+async function loadUsers(){try{const users=await request('/api/admin/users');q('#usersList').innerHTML=users.length?users.map(x=>'<p><b>'+x.telegram_id+'</b><br><small>'+(x.license_key||'Нет активного ключа')+'</small></p>').join(''):'<p class="muted">Пользователей пока нет.</p>'}catch(e){alert(e.message)}}q('#loadUsers').onclick=loadUsers;
+async function loadTickets(){try{const tickets=await request('/api/admin/tickets');q('#ticketsList').innerHTML=tickets.length?tickets.map(x=>'<article><b>#'+x.id+' · '+x.telegram_id+'</b><p>'+x.message+'</p><textarea data-reply="'+x.id+'" placeholder="Ответ пользователю"></textarea><button class="replyTicket buy" data-ticket="'+x.id+'">Ответить</button></article>').join(''):'<p class="muted">Обращений пока нет.</p>';document.querySelectorAll('.replyTicket').forEach(button=>button.onclick=async()=>{const id=button.dataset.ticket,box=q('[data-reply="'+id+'"]');try{await request('/api/admin/tickets/'+id+'/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:box.value})});box.value='';button.textContent='Отправлено';loadTickets()}catch(e){alert(e.message)}})}catch(e){alert(e.message)}}q('#loadTickets').onclick=loadTickets;
+q('#sendSupport').onclick=async()=>{const status=q('#supportStatus');try{const d=await request('/api/support',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q('#supportText').value})});q('#supportText').value='';status.textContent='Отправлено, номер обращения: #'+d.ticket_id}catch(e){status.textContent=e.message}};
+
+async function me(){try{const d=await request('/api/me');q('#adminNav').hidden=!d.is_admin;if(d.is_admin)loadAdmin();licenseActive=Boolean(d.license_key);renderBroadcast();profileCard.innerHTML=`<div class="avatar">◉</div><div><b>Пользователь Telegram</b><p class="muted">ID: ${d.telegram_id}</p></div><div class="license"><small>${d.license_key?'ДОСТУП АКТИВЕН':'НЕТ ДОСТУПА'}</small><b>${d.license_key?'до '+date(d.expires_at):'—'}</b></div>`;if(!d.terms_accepted)termsDialog.showModal()}catch{profileCard.innerHTML='<b>Откройте приложение через Telegram</b>'}}
+agreeButton.addEventListener('click',async()=>{try{await request('/api/terms/accept',{method:'POST'});termsDialog.close();me()}catch(e){alert(e.message)}});q('#activateKey').addEventListener('click',async()=>{try{const d=await request('/api/keys/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:licenseKey.value})});activationStatus.textContent='Ключ активирован. Доступ: '+date(d.expires_at);me()}catch(e){activationStatus.textContent=e.message}});
+plans();me();
