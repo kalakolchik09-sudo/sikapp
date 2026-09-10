@@ -83,8 +83,17 @@ class SupportTicket(Base):
     __tablename__ = "support_tickets"
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_id: Mapped[int] = mapped_column(index=True)
-    message: Mapped[str] = mapped_column(String(2000))
     status: Mapped[str] = mapped_column(String(20), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(index=True)
+    sender: Mapped[str] = mapped_column(String(20))  # "user" или "admin"
+    message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -117,14 +126,14 @@ class BroadcastTask(Base):
     groups_count: Mapped[int] = mapped_column(Integer, default=0)
     current_cycle: Mapped[int] = mapped_column(Integer, default=0)
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    status_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 Base.metadata.create_all(engine)
-app = FastAPI(title="License mini app")
+app = FastAPI(title="neverkBOT")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
-# --- Pyrogram clients store (временное хранение между запросами) ---
 pending_clients: dict[int, Client] = {}
 pending_phone: dict[int, str] = {}
 pending_hash: dict[int, str] = {}
@@ -142,11 +151,7 @@ class ManualKeyCreate(BaseModel):
     duration_days: int
 
 
-class SupportMessage(BaseModel):
-    message: str
-
-
-class SupportReply(BaseModel):
+class SupportMessageRequest(BaseModel):
     message: str
 
 
@@ -203,17 +208,49 @@ async def crypto(method: str, payload: dict) -> dict:
     return data["result"]
 
 
+async def tg_send(chat_id: int, text: str, reply_markup: dict | None = None) -> dict | None:
+    if not BOT_TOKEN:
+        return None
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+
+async def tg_edit(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> dict | None:
+    if not BOT_TOKEN:
+        return None
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload)
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+
+async def tg_answer_callback(callback_id: str, text: str = ""):
+    if not BOT_TOKEN:
+        return
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text})
+
+
 def key() -> str:
     return "LIC-" + base64.b32encode(secrets.token_bytes(12)).decode().rstrip("=")
 
 
 async def send_key(telegram_id: int, license_key: str, expires_at: datetime | None):
-    if not BOT_TOKEN:
-        return
     until = "бессрочно" if expires_at is None else expires_at.strftime("%d.%m.%Y")
     text = f"✅ Оплата получена!\n\nВаш ключ: <code>{license_key}</code>\nДействует: {until}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": telegram_id, "text": text, "parse_mode": "HTML"})
+    await tg_send(telegram_id, text)
 
 
 def accepted(telegram_id: int) -> bool:
@@ -272,7 +309,7 @@ async def activate(invoice_id: str) -> Order | None:
 
 
 # ============================================================
-# БАЗОВЫЕ ЭНДПОИНТЫ (из Бота №1)
+# БАЗОВЫЕ ЭНДПОИНТЫ
 # ============================================================
 
 @app.get("/")
@@ -291,6 +328,9 @@ def me(x_telegram_init_data: str | None = Header(default=None)):
     with Session(engine) as db:
         orders = db.scalars(select(Order).where(Order.telegram_id == telegram_id, Order.status == "paid").order_by(Order.created_at.desc())).all()
         latest = orders[0] if orders else None
+        active_task = db.scalar(
+            select(BroadcastTask).where(BroadcastTask.telegram_id == telegram_id, BroadcastTask.status == "active").order_by(BroadcastTask.created_at.desc())
+        )
         return {
             "telegram_id": telegram_id,
             "terms_accepted": db.get(TermsAcceptance, telegram_id) is not None,
@@ -298,6 +338,7 @@ def me(x_telegram_init_data: str | None = Header(default=None)):
             "expires_at": latest.expires_at if latest else None,
             "purchases": len(orders),
             "is_admin": telegram_id == ADMIN_TELEGRAM_ID,
+            "active_task_id": active_task.id if active_task else None,
         }
 
 
@@ -353,51 +394,110 @@ def admin_users(x_telegram_init_data: str | None = Header(default=None)):
     return result
 
 
-@app.get("/api/admin/tickets")
-def admin_tickets(x_telegram_init_data: str | None = Header(default=None)):
+# ============================================================
+# ПОДДЕРЖКА — ПОЛНОЦЕННЫЙ ЧАТ
+# ============================================================
+
+@app.get("/api/support/ticket")
+def get_or_create_ticket(x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
-    require_admin(telegram_id)
     with Session(engine) as db:
-        tickets = db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(30)).all()
-        return [{"id": ticket.id, "telegram_id": ticket.telegram_id, "message": ticket.message, "status": ticket.status, "created_at": ticket.created_at} for ticket in tickets]
+        ticket = db.scalar(select(SupportTicket).where(SupportTicket.telegram_id == telegram_id).order_by(SupportTicket.created_at.desc()))
+        if not ticket:
+            ticket = SupportTicket(telegram_id=telegram_id)
+            db.add(ticket)
+            db.commit()
+            db.refresh(ticket)
+        messages = db.scalars(select(SupportMessage).where(SupportMessage.ticket_id == ticket.id).order_by(SupportMessage.created_at)).all()
+        return {
+            "ticket_id": ticket.id,
+            "messages": [{"id": m.id, "sender": m.sender, "message": m.message, "created_at": m.created_at} for m in messages],
+        }
 
 
-@app.post("/api/support")
-async def create_ticket(body: SupportMessage, x_telegram_init_data: str | None = Header(default=None)):
+@app.post("/api/support/send")
+async def support_send(body: SupportMessageRequest, x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
     message = body.message.strip()
     if not message:
-        raise HTTPException(422, "Напишите сообщение для поддержки.")
+        raise HTTPException(422, "Пустое сообщение.")
     with Session(engine) as db:
-        ticket = SupportTicket(telegram_id=telegram_id, message=message)
-        db.add(ticket)
+        ticket = db.scalar(select(SupportTicket).where(SupportTicket.telegram_id == telegram_id).order_by(SupportTicket.created_at.desc()))
+        if not ticket:
+            ticket = SupportTicket(telegram_id=telegram_id)
+            db.add(ticket)
+            db.commit()
+            db.refresh(ticket)
+        msg = SupportMessage(ticket_id=ticket.id, sender="user", message=message)
+        db.add(msg)
+        ticket.updated_at = datetime.now(timezone.utc)
+        ticket.status = "open"
         db.commit()
-        db.refresh(ticket)
-    if BOT_TOKEN:
-        async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": ADMIN_TELEGRAM_ID, "text": f"🆘 Обращение #{ticket.id} от <code>{telegram_id}</code>\n\n{message}", "parse_mode": "HTML"})
-    return {"ticket_id": ticket.id}
+        db.refresh(msg)
+        result = {"id": msg.id, "sender": msg.sender, "message": msg.message, "created_at": msg.created_at}
+    await tg_send(
+        ADMIN_TELEGRAM_ID,
+        f"💬 <b>Поддержка</b> · тикет #{ticket.id}\n👤 <code>{telegram_id}</code>\n\n{message}",
+        {"inline_keyboard": [[{"text": "✍️ Ответить", "callback_data": f"sup_reply_{ticket.id}"}]]},
+    )
+    return result
 
 
-@app.post("/api/admin/tickets/{ticket_id}/reply")
-async def reply_ticket(ticket_id: int, body: SupportReply, x_telegram_init_data: str | None = Header(default=None)):
+@app.get("/api/admin/support/tickets")
+def admin_support_tickets(x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
     require_admin(telegram_id)
-    reply = body.message.strip()
-    if not reply:
-        raise HTTPException(422, "Введите ответ.")
+    with Session(engine) as db:
+        tickets = db.scalars(select(SupportTicket).order_by(SupportTicket.updated_at.desc()).limit(50)).all()
+        result = []
+        for t in tickets:
+            last = db.scalar(select(SupportMessage).where(SupportMessage.ticket_id == t.id).order_by(SupportMessage.created_at.desc()))
+            result.append({
+                "id": t.id, "telegram_id": t.telegram_id, "status": t.status,
+                "updated_at": t.updated_at, "last_message": last.message if last else "",
+            })
+        return result
+
+
+@app.get("/api/admin/support/tickets/{ticket_id}")
+def admin_support_ticket(ticket_id: int, x_telegram_init_data: str | None = Header(default=None)):
+    telegram_id = telegram_user(x_telegram_init_data)
+    require_admin(telegram_id)
     with Session(engine) as db:
         ticket = db.get(SupportTicket, ticket_id)
         if not ticket:
-            raise HTTPException(404, "Обращение не найдено.")
+            raise HTTPException(404, "Тикет не найден.")
+        messages = db.scalars(select(SupportMessage).where(SupportMessage.ticket_id == ticket_id).order_by(SupportMessage.created_at)).all()
+        return {
+            "ticket_id": ticket.id, "telegram_id": ticket.telegram_id,
+            "messages": [{"id": m.id, "sender": m.sender, "message": m.message, "created_at": m.created_at} for m in messages],
+        }
+
+
+@app.post("/api/admin/support/tickets/{ticket_id}/reply")
+async def admin_support_reply(ticket_id: int, body: SupportMessageRequest, x_telegram_init_data: str | None = Header(default=None)):
+    telegram_id = telegram_user(x_telegram_init_data)
+    require_admin(telegram_id)
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(422, "Пустой ответ.")
+    with Session(engine) as db:
+        ticket = db.get(SupportTicket, ticket_id)
+        if not ticket:
+            raise HTTPException(404, "Тикет не найден.")
+        msg = SupportMessage(ticket_id=ticket_id, sender="admin", message=message)
+        db.add(msg)
+        ticket.updated_at = datetime.now(timezone.utc)
         ticket.status = "answered"
         recipient = ticket.telegram_id
         db.commit()
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": recipient, "text": f"💬 <b>Ответ поддержки</b>\n\n{reply}", "parse_mode": "HTML"})
-        response.raise_for_status()
+    await tg_send(recipient, f"💬 <b>Ответ поддержки</b>\n\n{message}")
     return {"ok": True}
 
+
+# ============================================================
+# КЛЮЧИ / ОПЛАТА
+# ============================================================
 
 @app.post("/api/keys/activate")
 def activate_key(body: KeyActivation, x_telegram_init_data: str | None = Header(default=None)):
@@ -456,7 +556,7 @@ async def order_status(invoice_id: str, x_telegram_init_data: str | None = Heade
 
 
 # ============================================================
-# АККАУНТЫ (из Бота №2)
+# АККАУНТЫ
 # ============================================================
 
 @app.get("/api/accounts")
@@ -566,7 +666,7 @@ def delete_account(account_id: int, x_telegram_init_data: str | None = Header(de
 
 
 # ============================================================
-# РАССЫЛКА (из Бота №2 с новой логикой)
+# РАССЫЛКА
 # ============================================================
 
 async def get_user_groups(client: Client):
@@ -581,7 +681,6 @@ async def get_user_groups(client: Client):
 
 
 def pick_next_text(messages: list[str], last_index: int, safe_mode: bool) -> tuple[str, int]:
-    """Обычный режим: всегда messages[0]. Безопасный: случайный, не равный last_index."""
     if not messages:
         return "", -1
     if not safe_mode or len(messages) == 1:
@@ -601,6 +700,33 @@ def next_interval_seconds(base_minutes: int, safe_mode: bool) -> int:
     return random.randint(lo, hi)
 
 
+def build_status_text(task: BroadcastTask) -> str:
+    mode = "🛡 Безопасный" if task.safe_mode else "⚡ Обычный"
+    cycle = task.current_cycle
+    sent = task.sent_count
+    groups = task.groups_count
+    base = task.interval_minutes
+    if task.safe_mode:
+        lo = max(30, int(base * 0.8))
+        hi = min(120, int(base * 1.2))
+        interval = f"{lo}–{hi} мин"
+    else:
+        interval = f"{base} мин"
+    status_emoji = "🔄" if task.status == "active" else ("⏹" if task.status == "paused" else "❌")
+    return (
+        f"{status_emoji} <b>Рассылка {'запущена' if task.status == 'active' else 'остановлена'}</b>\n\n"
+        f"📋 Режим: {mode}\n"
+        f"⏱ Интервал: {interval}\n"
+        f"🔁 Цикл: <b>{cycle}</b>\n"
+        f"📨 Отправлено в <b>{sent}</b> чатов\n"
+        f"👥 Групп: <b>{groups}</b>"
+    )
+
+
+def stop_keyboard(task_id: int) -> dict:
+    return {"inline_keyboard": [[{"text": "⏹ Завершить рассылку", "callback_data": f"br_stop_{task_id}"}]]}
+
+
 async def broadcast_worker(task_id: int):
     with Session(engine) as db:
         task = db.get(BroadcastTask, task_id)
@@ -612,6 +738,7 @@ async def broadcast_worker(task_id: int):
         safe_mode = task.safe_mode
         interval_minutes = task.interval_minutes
         last_index = task.last_text_index
+        status_message_id = task.status_message_id
 
     clients: list[Client] = []
     with Session(engine) as db:
@@ -633,6 +760,9 @@ async def broadcast_worker(task_id: int):
             if t:
                 t.status = "error"
                 db.commit()
+                text = build_status_text(t)
+        if status_message_id:
+            await tg_edit(telegram_id, status_message_id, text)
         return
 
     try:
@@ -669,11 +799,15 @@ async def broadcast_worker(task_id: int):
                             t = db.get(BroadcastTask, task_id)
                             if t:
                                 t.sent_count += 1
-                                t.current_cycle += 0 if cycle_sent > 1 else 1
+                                if cycle_sent == 1:
+                                    t.current_cycle += 1
                                 t.groups_count = groups_total
                                 t.last_text_index = last_index
                                 t.last_sent_at = datetime.now(timezone.utc)
                                 db.commit()
+                                snapshot = t
+                        if status_message_id and cycle_sent % 5 == 0:
+                            await tg_edit(telegram_id, status_message_id, build_status_text(snapshot), stop_keyboard(task_id))
                         await asyncio.sleep(1)
                     except FloodWait as e:
                         await asyncio.sleep(e.value)
@@ -684,6 +818,10 @@ async def broadcast_worker(task_id: int):
                 t = db.get(BroadcastTask, task_id)
                 if not t or t.status != "active":
                     break
+                snapshot = t
+
+            if status_message_id:
+                await tg_edit(telegram_id, status_message_id, build_status_text(snapshot), stop_keyboard(task_id))
 
             wait_seconds = next_interval_seconds(interval_minutes, safe_mode)
             for _ in range(wait_seconds // 5):
@@ -704,6 +842,15 @@ async def broadcast_worker(task_id: int):
                 await client.stop()
             except Exception:
                 pass
+        with Session(engine) as db:
+            t = db.get(BroadcastTask, task_id)
+            if t:
+                if t.status == "active":
+                    t.status = "paused"
+                    db.commit()
+                text = build_status_text(t)
+        if status_message_id:
+            await tg_edit(telegram_id, status_message_id, text)
 
 
 @app.get("/api/broadcast/tasks")
@@ -756,13 +903,23 @@ async def broadcast_start(body: BroadcastStart, x_telegram_init_data: str | None
         db.commit()
         db.refresh(task)
         task_id = task.id
+        text = build_status_text(task)
+        keyboard = stop_keyboard(task_id)
+
+    msg = await tg_send(telegram_id, text, keyboard)
+    if msg and msg.get("ok"):
+        with Session(engine) as db:
+            t = db.get(BroadcastTask, task_id)
+            if t:
+                t.status_message_id = msg["result"]["message_id"]
+                db.commit()
 
     asyncio.create_task(broadcast_worker(task_id))
     return {"task_id": task_id}
 
 
 @app.post("/api/broadcast/stop/{task_id}")
-def broadcast_stop(task_id: int, x_telegram_init_data: str | None = Header(default=None)):
+async def broadcast_stop(task_id: int, x_telegram_init_data: str | None = Header(default=None)):
     telegram_id = telegram_user(x_telegram_init_data)
     require_license(telegram_id)
     with Session(engine) as db:
@@ -771,6 +928,10 @@ def broadcast_stop(task_id: int, x_telegram_init_data: str | None = Header(defau
             raise HTTPException(404, "Задача не найдена.")
         task.status = "paused"
         db.commit()
+        status_message_id = task.status_message_id
+        text = build_status_text(task)
+    if status_message_id:
+        await tg_edit(telegram_id, status_message_id, text)
     return {"ok": True}
 
 
@@ -786,7 +947,7 @@ def broadcast_status(task_id: int, x_telegram_init_data: str | None = Header(def
             "id": task.id, "status": task.status, "safe_mode": task.safe_mode,
             "current_cycle": task.current_cycle, "sent_count": task.sent_count,
             "groups_count": task.groups_count, "last_text_index": task.last_text_index,
-            "last_sent_at": task.last_sent_at,
+            "last_sent_at": task.last_sent_at, "interval_minutes": task.interval_minutes,
         }
 
 
@@ -811,24 +972,97 @@ async def telegram_webhook(secret: str, request: Request):
     if not TELEGRAM_WEBHOOK_SECRET or not hmac.compare_digest(secret, TELEGRAM_WEBHOOK_SECRET):
         raise HTTPException(404, "Не найдено")
     update = await request.json()
-    message = update.get("message", {})
-    if not message.get("text", "").startswith("/start") or not BOT_TOKEN:
+
+    # callback от кнопки «Завершить рассылку»
+    callback = update.get("callback_query")
+    if callback:
+        data = callback.get("data", "")
+        callback_id = callback.get("id", "")
+        if data.startswith("br_stop_"):
+            try:
+                task_id = int(data.split("_")[-1])
+            except ValueError:
+                await tg_answer_callback(callback_id, "Ошибка")
+                return {"ok": True}
+            with Session(engine) as db:
+                task = db.get(BroadcastTask, task_id)
+                if task:
+                    task.status = "paused"
+                    db.commit()
+                    status_message_id = task.status_message_id
+                    text = build_status_text(task)
+                else:
+                    task = None
+                    text = ""
+                    status_message_id = None
+            if status_message_id:
+                await tg_edit(task.telegram_id, status_message_id, text)
+            await tg_answer_callback(callback_id, "Рассылка остановлена")
+            return {"ok": True}
+        if data.startswith("sup_reply_"):
+            try:
+                ticket_id = int(data.split("_")[-1])
+            except ValueError:
+                await tg_answer_callback(callback_id, "Ошибка")
+                return {"ok": True}
+            with Session(engine) as db:
+                ticket = db.get(SupportTicket, ticket_id)
+                recipient = ticket.telegram_id if ticket else None
+            if recipient:
+                await tg_send(
+                    ADMIN_TELEGRAM_ID,
+                    f"✍️ <b>Ответ на тикет #{ticket_id}</b>\n\nНапишите ваш ответ одним сообщением:",
+                )
+            await tg_answer_callback(callback_id, "Напишите ответ в чат")
+            return {"ok": True}
+        await tg_answer_callback(callback_id)
         return {"ok": True}
+
+    message = update.get("message", {})
+    text = message.get("text", "")
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
         return {"ok": True}
-    text = ("👋 <b>Добро пожаловать!</b>\n\n"
-            "Здесь можно ознакомиться с сервисом, принять соглашение и выбрать лицензию. "
-            "Нажмите кнопку ниже, чтобы открыть приложение.")
-    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-    forwarded_proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
-    web_app_url = f"{forwarded_proto}://{forwarded_host}" if forwarded_host else WEBAPP_URL
-    if not web_app_url.startswith("https://"):
-        web_app_url = WEBAPP_URL
-    if not web_app_url or not web_app_url.startswith("https://"):
-        logger.error("No valid public HTTPS WEBAPP_URL is configured.")
+
+    # Ответ админа на тикет (если это reply на сообщение поддержки — обрабатываем ниже)
+    if text.startswith("/start"):
+        if not BOT_TOKEN:
+            return {"ok": True}
+        welcome = ("👋 <b>Добро пожаловать!</b>\n\n"
+                   "Здесь можно ознакомиться с сервисом, принять соглашение и выбрать лицензию. "
+                   "Нажмите кнопку ниже, чтобы открыть приложение.")
+        forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        forwarded_proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+        web_app_url = f"{forwarded_proto}://{forwarded_host}" if forwarded_host else WEBAPP_URL
+        if not web_app_url.startswith("https://"):
+            web_app_url = WEBAPP_URL
+        if not web_app_url or not web_app_url.startswith("https://"):
+            return {"ok": True}
+        keyboard = {"inline_keyboard": [[{"text": "🚀 Запустить", "web_app": {"url": web_app_url}}]]}
+        await tg_send(chat_id, welcome, keyboard)
         return {"ok": True}
-    keyboard = {"inline_keyboard": [[{"text": "🚀 Запустить", "web_app": {"url": web_app_url}}]]}
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": keyboard})
+
+    # Ответ админа через reply на уведомление поддержки
+    reply_to = message.get("reply_to_message", {})
+    if chat_id == ADMIN_TELEGRAM_ID and reply_to:
+        reply_text = reply_to.get("text", "")
+        if "Поддержка" in reply_text and "тикет #" in reply_text:
+            try:
+                ticket_part = reply_text.split("тикет #")[1]
+                ticket_id = int(ticket_part.split()[0].strip("·").strip())
+            except Exception:
+                return {"ok": True}
+            with Session(engine) as db:
+                ticket = db.get(SupportTicket, ticket_id)
+                if not ticket:
+                    return {"ok": True}
+                msg = SupportMessage(ticket_id=ticket_id, sender="admin", message=text)
+                db.add(msg)
+                ticket.status = "answered"
+                ticket.updated_at = datetime.now(timezone.utc)
+                recipient = ticket.telegram_id
+                db.commit()
+            await tg_send(recipient, f"💬 <b>Ответ поддержки</b>\n\n{text}")
+            return {"ok": True}
+
     return {"ok": True}
